@@ -597,6 +597,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
         &schema,
         "CommandCredentialConfig",
         &[
+            "aws_auth",
             "base_url_env_var",
             "credential_format",
             "credential_key",
@@ -737,6 +738,31 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
                 == Some("#/$defs/CommandEdgeConfig")),
         "CommandPolicyConfig.from must allow edge objects with sandbox and invocation_policy"
     );
+}
+
+#[test]
+fn test_schema_validates_command_proxy_credential_with_aws_auth() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "command_policies": {
+            "credentials": {
+                "bedrock": {
+                    "type": "proxy",
+                    "upstream": "https://bedrock-runtime.us-east-1.amazonaws.com",
+                    "aws_auth": {
+                        "profile": "production",
+                        "region": "us-east-1",
+                        "service": "bedrock"
+                    }
+                }
+            }
+        }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("command proxy credential with aws_auth should validate");
 }
 
 #[test]
@@ -1114,7 +1140,66 @@ fn test_schema_rollback_config_matches_rust_model() {
 #[test]
 fn test_schema_diagnostics_config_matches_rust_model() {
     let schema = load_schema();
-    assert_schema_properties(&schema, "DiagnosticsConfig", &["suppress_system_services"]);
+    assert_schema_properties(
+        &schema,
+        "DiagnosticsConfig",
+        &[
+            "suppress_system_services",
+            "redaction",
+            "network_denial_audit",
+        ],
+    );
+}
+
+#[test]
+fn test_schema_network_denial_audit_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(
+        &schema,
+        "NetworkDenialAuditConfig",
+        &["rate_per_sec", "burst"],
+    );
+}
+
+/// The schema bounds must equal the ceilings `NetworkDenialAuditLimits`
+/// enforces, so an editor accepting a value never disagrees with nono.
+#[test]
+fn test_schema_network_denial_audit_bounds_match_runtime_ceilings() {
+    let schema = load_schema();
+    let props = &schema["$defs"]["NetworkDenialAuditConfig"]["properties"];
+    assert_eq!(props["rate_per_sec"]["minimum"], 1);
+    assert_eq!(props["rate_per_sec"]["maximum"], 1000);
+    assert_eq!(props["burst"]["minimum"], 1);
+    assert_eq!(props["burst"]["maximum"], 10000);
+}
+
+#[test]
+fn test_schema_redaction_config_matches_rust_model() {
+    let schema = load_schema();
+    assert_schema_properties(&schema, "RedactionConfig", &["extra_env_vars"]);
+}
+
+/// Every env-var pattern list resolves to one definition, so tightening
+/// validation in `validate_env_var_patterns` has a single schema counterpart
+/// instead of three that can drift apart.
+#[test]
+fn test_schema_env_var_pattern_lists_share_one_definition() {
+    let schema = load_schema();
+    assert!(
+        schema.pointer("/$defs/EnvVarPattern").is_some(),
+        "schema should define $defs/EnvVarPattern"
+    );
+    for pointer in [
+        "/$defs/EnvironmentConfig/properties/allow_vars/items/$ref",
+        "/$defs/EnvironmentConfig/properties/deny_vars/items/$ref",
+        "/$defs/RedactionConfig/properties/extra_env_vars/items/$ref",
+    ] {
+        assert_eq!(
+            schema.pointer(pointer).and_then(Value::as_str),
+            Some("#/$defs/EnvVarPattern"),
+            "{pointer} should reference the shared env-var pattern definition"
+        );
+    }
 }
 
 #[test]
@@ -1269,6 +1354,46 @@ fn test_schema_rejects_empty_and_nul_env_patterns() {
         validator.validate(&valid_infix).is_ok(),
         "schema should accept infix/leading wildcard patterns"
     );
+
+    for blank in ["   ", "\t", " \n "] {
+        let whitespace_pattern = json!({ "environment": { "deny_vars": [blank] } });
+        assert!(
+            validator.validate(&whitespace_pattern).is_err(),
+            "schema should reject a whitespace-only deny_vars pattern {blank:?}"
+        );
+    }
+}
+
+/// `diagnostics.redaction.extra_env_vars` shares its grammar and its
+/// validation with `environment.deny_vars`, so the schema must reject the
+/// same entries `validate_env_var_patterns` rejects. An entry accepted here
+/// and dropped at runtime is a rule the author believes is in force and is
+/// not.
+#[test]
+fn test_schema_rejects_empty_whitespace_and_nul_redaction_patterns() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+
+    for rejected in ["", "   ", "\t", " \n ", "ACME\u{0}TOKEN"] {
+        let profile = json!({
+            "diagnostics": { "redaction": { "extra_env_vars": [rejected] } }
+        });
+        assert!(
+            validator.validate(&profile).is_err(),
+            "schema should reject extra_env_vars entry {rejected:?}"
+        );
+    }
+
+    let accepted = json!({
+        "diagnostics": {
+            "redaction": {
+                "extra_env_vars": ["DEPLOY_TOKEN", "ACME_*", "*_SECRET", "AWS_*_TOKEN", "*"]
+            }
+        }
+    });
+    validator
+        .validate(&accepted)
+        .expect("schema should accept exact names and wildcard redaction patterns");
 }
 
 #[test]

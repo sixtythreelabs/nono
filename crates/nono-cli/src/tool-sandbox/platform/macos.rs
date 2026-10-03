@@ -10,19 +10,19 @@ use crate::tool_sandbox::command_policy_decision::CommandPolicyDecision;
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
     apply_environment_set_vars, apply_export_env, default_env_allow_patterns,
-    effective_argv_for_binary, env_shebang_target_interpreter, inject_chaining_control_env,
-    inject_url_open_env, split_env_entry,
+    effective_argv_for_binary, env_shebang_target_interpreter, inject_url_open_env,
+    split_env_entry,
 };
 use crate::tool_sandbox::launch::{
     exit_status_code, prepare_launcher_command, remove_launch_spec, write_launch_spec,
 };
 use crate::tool_sandbox::protocol::{
     ChildCapsSpec, FsGrantSpec, StdioFds, StdioLimitActionSpec, StdioLimitSpec,
-    StdioStreamLimitSpec, TOOL_SANDBOX_LAUNCH_SPEC_ENV, TOOL_SANDBOX_SHIM_DIR_ENV,
-    TOOL_SANDBOX_SOCKET_ENV, TOOL_SANDBOX_URL_IO_TIMEOUT, ToolSandboxChildLaunchSpec,
-    ToolSandboxOpenUrlRequest, ToolSandboxOpenUrlResponse, ToolSandboxShimRequest,
-    ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame, recv_frame_ack, recv_stdio_fds,
-    send_frame_ack, send_stdio_fds, validate_ipc_request, write_frame, write_response,
+    StdioStreamLimitSpec, TOOL_SANDBOX_LAUNCH_SPEC_ENV, TOOL_SANDBOX_URL_IO_TIMEOUT,
+    ToolSandboxChildLaunchSpec, ToolSandboxOpenUrlRequest, ToolSandboxOpenUrlResponse,
+    ToolSandboxShimRequest, ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame,
+    recv_frame_ack, recv_stdio_fds, send_frame_ack, send_stdio_fds, validate_ipc_request,
+    write_frame, write_response,
 };
 use nix::libc;
 use nix::sys::signal::{self, Signal};
@@ -163,6 +163,12 @@ struct ToolSandboxState {
     /// Agent's resolved filesystem deny paths; a command's live cwd under any of
     /// these is rejected (the agent's broad allow may otherwise cover them).
     deny_paths: Vec<PathBuf>,
+    /// The agent's deny paths paired with the bypass_protection paths that lift
+    /// them. A command policy's own keychain grant is authorized against this,
+    /// so a mediated command can never exceed the agent's keychain authority.
+    deny_policy: crate::policy::EffectiveDenyPolicy,
+    /// Snapshot of keychain filesystem denies, including mode-scoped bypasses.
+    keychain_deny_rules: Vec<String>,
     plan: ResolvedToolSandboxPlan,
     shims_by_command: BTreeMap<String, ShimIdentity>,
     shims_by_path: BTreeMap<PathBuf, String>,
@@ -276,6 +282,7 @@ impl PreparedToolSandboxRuntime {
             blocked_commands,
             outer_caps,
             deny_paths,
+            bypass_protection_paths,
             policy_root,
             proxy_credentials,
             reserved_proxy_ports,
@@ -285,6 +292,11 @@ impl PreparedToolSandboxRuntime {
         } = input;
 
         validate_platform_requirements(config)?;
+        let deny_policy = crate::policy::EffectiveDenyPolicy::from_applied_bypasses(
+            deny_paths,
+            bypass_protection_paths,
+        );
+        let keychain_deny_rules = deny_policy.keychain_child_deny_rules()?;
 
         let plan = ResolvedToolSandboxPlan::build(
             config,
@@ -352,6 +364,8 @@ impl PreparedToolSandboxRuntime {
                 policy_root: policy_root.to_path_buf(),
                 outer_caps: outer_caps.clone(),
                 deny_paths: deny_paths.to_vec(),
+                deny_policy,
+                keychain_deny_rules,
                 plan,
                 shims_by_command,
                 shims_by_path,
@@ -388,19 +402,9 @@ impl PreparedToolSandboxRuntime {
     }
 
     /// Returns environment overrides to inject into the child process.
-    /// Prepends the shim directory to PATH and sets command-mediation socket variables.
+    /// Prepends the session shim directory to PATH for command lookup.
     pub(crate) fn env_overrides(&self) -> Vec<(String, String)> {
-        vec![
-            ("PATH".to_string(), self.inner.session_path.clone()),
-            (
-                TOOL_SANDBOX_SOCKET_ENV.to_string(),
-                self.inner.socket_path.display().to_string(),
-            ),
-            (
-                TOOL_SANDBOX_SHIM_DIR_ENV.to_string(),
-                self.inner.shim_dir.display().to_string(),
-            ),
-        ]
+        vec![("PATH".to_string(), self.inner.session_path.clone())]
     }
 
     pub(crate) fn broker_secret_env_vars(
@@ -605,35 +609,26 @@ pub(crate) fn maybe_run_internal_tool_sandbox_entrypoint() -> bool {
         return true;
     }
 
-    // The browser-open shim is also a copy of the nono binary; detect it before
-    // the generic shim path since it does not use the shim handshake socket.
-    if crate::tool_sandbox::url_shim::current_exe_is_url_open_shim() {
-        exit_from_result(crate::tool_sandbox::url_shim::run_url_open_shim());
-        return true;
+    let shim = match crate::tool_sandbox::shim::Shim::current() {
+        Ok(Some(shim)) => shim,
+        Ok(None) => return false,
+        Err(err) => {
+            exit_from_result(Err(err));
+            return true;
+        }
+    };
+    // A recognized shim always exits through its broker flow, including when
+    // the socket is missing or the broker rejects it. Never parse shim argv as
+    // top-level nono subcommands (ps, stop, rollback, ...).
+    let socket_path = shim.socket_path();
+    if shim.is_url_open() {
+        exit_from_result(crate::tool_sandbox::url_shim::run_url_open_shim(
+            &socket_path,
+        ));
+    } else {
+        exit_from_result(run_shim(&shim.exe, &socket_path));
     }
-
-    if std::env::var_os(TOOL_SANDBOX_SOCKET_ENV).is_some()
-        && std::env::var_os(TOOL_SANDBOX_SHIM_DIR_ENV).is_some()
-        && current_exe_is_tool_sandbox_shim()
-    {
-        exit_from_result(run_shim());
-        return true;
-    }
-
-    // A shim copy with a missing/invalid handshake must not fall through to
-    // Cli::parse(), which would parse its argv as top-level nono subcommands
-    // (ps, stop, rollback, ...) against unrelated sessions.
-    if current_exe_is_tool_sandbox_shim_copy_by_path() {
-        exit_from_result(Err(NonoError::SandboxInit(
-            "running as a command-mediation shim copy but the broker handshake \
-             (NONO_TOOL_SANDBOX_SOCKET / NONO_TOOL_SANDBOX_SHIM_DIR) is missing \
-             or invalid; refusing rather than falling back to the nono CLI"
-                .to_string(),
-        )));
-        return true;
-    }
-
-    false
+    true
 }
 
 pub(crate) fn record_main_start() {}
@@ -649,50 +644,10 @@ fn exit_from_result(result: Result<()>) {
     }
 }
 
-fn current_exe_is_tool_sandbox_shim() -> bool {
-    let Some(shim_dir) = std::env::var_os(TOOL_SANDBOX_SHIM_DIR_ENV).map(PathBuf::from) else {
-        return false;
-    };
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    exe.starts_with(shim_dir)
-}
-
-/// Identity check independent of [`TOOL_SANDBOX_SHIM_DIR_ENV`]; used only to
-/// refuse execution, never to grant broker access.
-fn current_exe_is_tool_sandbox_shim_copy_by_path() -> bool {
-    std::env::current_exe()
-        .map(|exe| path_has_tool_sandbox_shim_shape(&exe))
-        .unwrap_or(false)
-}
-
-fn path_has_tool_sandbox_shim_shape(exe: &Path) -> bool {
-    let Some(shims_dir) = exe.parent() else {
-        return false;
-    };
-    if shims_dir.file_name().and_then(OsStr::to_str) != Some("shims") {
-        return false;
-    }
-    let Some(runtime_dir_name) = shims_dir
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(OsStr::to_str)
-    else {
-        return false;
-    };
-    runtime_dir_name.starts_with("nono-tool-sandbox-")
-}
-
-fn run_shim() -> Result<()> {
-    let socket_path = std::env::var_os(TOOL_SANDBOX_SOCKET_ENV)
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            NonoError::SandboxInit("command-mediation shim socket env missing".to_string())
-        })?;
-    let command = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_name().map(OsStr::to_os_string))
+fn run_shim(shim_exe: &Path, socket_path: &Path) -> Result<()> {
+    let command = shim_exe
+        .file_name()
+        .map(OsStr::to_os_string)
         .and_then(|n| n.into_string().ok())
         .ok_or_else(|| {
             NonoError::SandboxInit("command-mediation shim command name invalid".to_string())
@@ -734,7 +689,7 @@ fn run_shim() -> Result<()> {
     };
     validate_ipc_request(&request)?;
 
-    let mut stream = UnixStream::connect(&socket_path).map_err(|e| {
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
         NonoError::SandboxInit(format!(
             "command-mediation shim connect to {}: {e}",
             socket_path.display()
@@ -3218,13 +3173,13 @@ fn build_child_caps(
         &state.outer_caps,
         &state.deny_paths,
     )?;
-    // When the command was granted a keychain DB file (e.g. login.keychain-db),
-    // reuse the main-path keychain mechanism: add the WAL/SHM/`.fl`/`user.kb`
-    // sibling-file exceptions the Security framework touches. The library
-    // profile separately auto-unlocks the securityd/SecurityServer mach-lookups
-    // when a keychain DB cap is present (see has_explicit_keychain_db_access).
-    // No-op when no keychain DB grant exists.
-    crate::policy::apply_macos_keychain_db_exception(&mut caps);
+    // SECURITY: authorized against the *agent's* deny/bypass policy, so a
+    // command policy granting login.keychain-db cannot reach a keychain the
+    // outer sandbox is denied.
+    for rule in &state.keychain_deny_rules {
+        caps.add_platform_rule(rule.clone())?;
+    }
+    crate::policy::apply_macos_keychain_db_exception(&mut caps, &state.deny_policy);
     add_policy_network(&mut caps, policy)?;
     add_policy_proxy_network(&mut caps, state, request, policy, proxy_scope)?;
     add_proxy_trust_bundle_caps(&mut caps, state, policy)?;
@@ -3852,6 +3807,19 @@ fn add_proxy_trust_bundle_caps(
     }
     for path in &state.proxy_trust_bundle_paths {
         caps.add_fs(FsCapability::new_file(path, AccessMode::Read)?);
+        // On macOS, the nono state root (~/.local/state/nono) is protected by a
+        // Seatbelt `(deny file-read-data (subpath ...))` rule. A generic FS cap
+        // is shadowed by this action-specific deny: Seatbelt's action specificity
+        // beats path specificity. The session-level code (proxy_runtime.rs) handles
+        // this by emitting action-matching `file-read-data` / `file-read-metadata`
+        // allows, which are appended after the deny and win by both specificity and
+        // last-match. The child's Seatbelt profile needs the same override.
+        let path_str = crate::policy::path_to_utf8(path)?;
+        let escaped = crate::policy::escape_seatbelt_path(path_str)?;
+        caps.add_platform_rule(format!("(allow file-read-data (literal \"{escaped}\"))"))?;
+        caps.add_platform_rule(format!(
+            "(allow file-read-metadata (literal \"{escaped}\"))"
+        ))?;
     }
     Ok(())
 }
@@ -3954,7 +3922,7 @@ fn filter_child_env(
         }
     }
 
-    // Runs before PATH/chaining/set_vars/creds so nono-injected vars still win.
+    // Runs before PATH/set_vars/creds so nono-injected vars still win.
     apply_export_env(
         &mut result,
         request,
@@ -3962,7 +3930,6 @@ fn filter_child_env(
     );
     result.retain(|entry| !entry.starts_with(b"PATH="));
     result.push(format!("PATH={}", state.session_path).into_bytes());
-    inject_chaining_control_env(&mut result, &state.socket_path, &state.shim_dir);
     inject_url_open_env(
         &mut result,
         policy,
@@ -5655,33 +5622,45 @@ mod tests {
     };
 
     #[test]
-    fn shim_shape_matches_materialised_shim_copy() {
-        assert!(path_has_tool_sandbox_shim_shape(Path::new(
-            "/private/tmp/nono-tool-sandbox-abc123/shims/git"
-        )));
+    fn env_display_redacts_values_matching_profile_patterns() {
+        // The audit path for a mediated child dumps its whole environment.
+        // A profile-supplied pattern must reach this choke point, or a
+        // credential a deployment knows about is written out in cleartext.
+        let mut redactions = nono::ScrubPolicy::secure_default();
+        redactions.add_env_var_pattern("ACME_*");
+
+        let env = vec![
+            b"ACME_API_KEY=super-secret".to_vec(),
+            b"acme_app_key=also-secret".to_vec(),
+            b"PATH=/usr/bin".to_vec(),
+        ];
+
+        let entries = env_display(&env, &redactions);
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].value_display, "[REDACTED]");
+        assert_eq!(entries[1].value_display, "[REDACTED]");
+        assert_eq!(
+            entries[2].value_display, "/usr/bin",
+            "non-matching variables stay visible"
+        );
     }
 
     #[test]
-    fn shim_shape_rejects_wrong_parent_dir_name() {
-        // Not inside a `shims/` directory at all.
-        assert!(!path_has_tool_sandbox_shim_shape(Path::new(
-            "/private/tmp/nono-tool-sandbox-abc123/git"
-        )));
-    }
+    fn env_display_without_patterns_matches_secure_default() {
+        let redactions = nono::ScrubPolicy::secure_default();
+        let env = vec![
+            b"ACME_API_KEY=super-secret".to_vec(),
+            b"OPENAI_API_KEY=provider-secret".to_vec(),
+        ];
 
-    #[test]
-    fn shim_shape_rejects_wrong_grandparent_prefix() {
-        // `shims/` exists, but its parent isn't a `nono-tool-sandbox-*` dir.
-        assert!(!path_has_tool_sandbox_shim_shape(Path::new(
-            "/private/tmp/some-other-dir/shims/git"
-        )));
-    }
+        let entries = env_display(&env, &redactions);
 
-    #[test]
-    fn shim_shape_rejects_arbitrary_copy() {
-        assert!(!path_has_tool_sandbox_shim_shape(Path::new(
-            "/tmp/notshim/git"
-        )));
+        assert_eq!(
+            entries[0].value_display, "super-secret",
+            "patterns are opt-in; behavior is unchanged without a profile"
+        );
+        assert_eq!(entries[1].value_display, "[REDACTED]");
     }
 
     fn test_binary(name: &str, path: &Path) -> Result<ResolvedCommandBinary> {
@@ -5727,6 +5706,8 @@ mod tests {
             policy_root: PathBuf::from("/tmp"),
             outer_caps: CapabilitySet::new(),
             deny_paths: Vec::new(),
+            deny_policy: crate::policy::EffectiveDenyPolicy::new(&[], &[]),
+            keychain_deny_rules: Vec::new(),
             plan: ResolvedToolSandboxPlan {
                 config: CommandPoliciesConfig::default(),
                 resolved: ResolvedCommandBinaries {
@@ -8953,7 +8934,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_child_env_uses_safe_default_and_chaining_env() -> Result<()> {
+    fn filter_child_env_uses_safe_defaults_without_shim_discovery_env() -> Result<()> {
         let state = test_state();
         let request = request_with_env(vec![
             b"PATH=/usr/bin".to_vec(),
@@ -8961,6 +8942,8 @@ mod tests {
             b"CUSTOM=value".to_vec(),
             b"LD_PRELOAD=/evil.dylib".to_vec(),
             b"NONO_TOOL_SANDBOX_SOCKET=/old.sock".to_vec(),
+            b"NONO_TOOL_SANDBOX_SHIM_DIR=/old/shims".to_vec(),
+            b"NONO_TOOL_SANDBOX_URL_SOCKET=/old-url.sock".to_vec(),
             b"NONO_TOOL_SANDBOX_LAUNCH_SPEC=/old.json".to_vec(),
         ]);
 
@@ -8977,14 +8960,9 @@ mod tests {
             &env,
             format!("PATH={}", state.session_path).as_bytes()
         ));
-        assert!(contains_entry(
-            &env,
-            format!("{TOOL_SANDBOX_SOCKET_ENV}={}", state.socket_path.display()).as_bytes()
-        ));
-        assert!(contains_entry(
-            &env,
-            format!("{TOOL_SANDBOX_SHIM_DIR_ENV}={}", state.shim_dir.display()).as_bytes()
-        ));
+        assert!(!contains_prefix(&env, b"NONO_TOOL_SANDBOX_SOCKET="));
+        assert!(!contains_prefix(&env, b"NONO_TOOL_SANDBOX_SHIM_DIR="));
+        assert!(!contains_prefix(&env, b"NONO_TOOL_SANDBOX_URL_SOCKET="));
         assert!(!contains_prefix(&env, b"CUSTOM="));
         assert!(!contains_prefix(&env, b"LD_PRELOAD="));
         assert!(!contains_entry(&env, b"NONO_TOOL_SANDBOX_SOCKET=/old.sock"));
@@ -9241,5 +9219,172 @@ mod tests {
         let (argv, env) = parse_procargs2(&buf).expect("buffer is well-formed enough to parse");
         assert_eq!(argv, vec!["one".to_string(), "two".to_string()]);
         assert!(env.is_empty());
+    }
+
+    fn child_keychain_rules(state: &ToolSandboxState, grant: nono::FsCapability) -> String {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(grant);
+        crate::policy::apply_macos_keychain_db_exception(&mut caps, &state.deny_policy);
+        caps.platform_rules().join("\n")
+    }
+
+    #[test]
+    fn command_policy_keychain_grant_cannot_bypass_outer_deny() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let mut state = test_state();
+        state.deny_policy =
+            crate::policy::EffectiveDenyPolicy::new(&fixture.keychain_denies(), &[]);
+
+        let rules = child_keychain_rules(
+            &state,
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::ReadWrite,
+                nono::CapabilitySource::User,
+            ),
+        );
+
+        assert!(
+            rules.is_empty(),
+            "a command policy must not reach a keychain the agent is denied, got: {rules}"
+        );
+    }
+
+    #[test]
+    fn command_policy_keychain_grant_with_outer_bypass_grants_only_requested_access() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let mut state = test_state();
+        state.deny_policy = crate::policy::EffectiveDenyPolicy::new(
+            &fixture.keychain_denies(),
+            std::slice::from_ref(&fixture.login_db),
+        );
+
+        let rules = child_keychain_rules(
+            &state,
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::Read,
+                nono::CapabilitySource::User,
+            ),
+        );
+
+        assert!(
+            rules.contains("file-read-data"),
+            "expected the bypassed read grant to be honored, got: {rules}"
+        );
+        assert!(
+            rules.contains("(allow mach-lookup (global-name \"com.apple.securityd\"))"),
+            "expected the keychain mach services to be unlocked, got: {rules}"
+        );
+        assert!(
+            !rules.contains("file-write"),
+            "a read grant must not gain write access, got: {rules}"
+        );
+    }
+
+    #[test]
+    fn command_policy_write_grant_cannot_expand_outer_read_only_bypass() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let mut state = test_state();
+        state.deny_policy = crate::policy::EffectiveDenyPolicy::from_applied_bypasses(
+            &fixture.keychain_denies(),
+            &[crate::policy::AppliedBypass {
+                path: fixture.login_db.clone(),
+                access: AccessMode::Read,
+                is_file: true,
+                removed_denies: Vec::new(),
+            }],
+        );
+
+        let rules = child_keychain_rules(
+            &state,
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::ReadWrite,
+                nono::CapabilitySource::User,
+            ),
+        );
+
+        assert!(
+            rules.is_empty(),
+            "a command policy must not widen the agent's read-only bypass: {rules}"
+        );
+    }
+
+    #[test]
+    fn command_policy_keychain_grant_with_unrelated_outer_bypass_is_ineffective() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let mut state = test_state();
+        state.deny_policy = crate::policy::EffectiveDenyPolicy::new(
+            &fixture.keychain_denies(),
+            &[fixture.home.join("Documents")],
+        );
+
+        let rules = child_keychain_rules(
+            &state,
+            crate::test_env::keychain_file_cap(
+                &fixture.login_db,
+                AccessMode::Read,
+                nono::CapabilitySource::User,
+            ),
+        );
+
+        assert!(
+            rules.is_empty(),
+            "an unrelated outer bypass must not authorize the keychain, got: {rules}"
+        );
+    }
+
+    #[test]
+    fn child_caps_enforce_keychain_denies_for_file_and_directory_grants() {
+        let fixture = crate::test_env::KeychainFixture::new();
+        let mut state = test_state();
+        state.shim_dir = fixture.home.join("shims");
+        fs::create_dir(&state.shim_dir).expect("shims");
+        state.socket_path = fixture.home.join("broker.sock");
+        let _listener = UnixListener::bind(&state.socket_path).expect("socket");
+        state.deny_policy = crate::policy::EffectiveDenyPolicy::from_applied_bypasses(
+            &fixture.keychain_denies(),
+            &[],
+        );
+        state.keychain_deny_rules = state
+            .deny_policy
+            .keychain_child_deny_rules()
+            .expect("rules");
+        let binary = test_binary("sh", Path::new("/bin/sh")).expect("binary");
+        let request = request_with_env(Vec::new());
+        for directory in [false, true] {
+            let policy: CommandSandboxConfig = serde_json::from_value(if directory {
+                serde_json::json!({"fs_write": [fixture.keychains]})
+            } else {
+                serde_json::json!({"fs_write_file": [fixture.login_db]})
+            })
+            .expect("policy");
+            let caps = build_child_caps(
+                &state,
+                &binary,
+                &policy,
+                &request,
+                &state.shim_dir,
+                "review",
+            )
+            .expect("child caps");
+            assert!(
+                caps.fs_capabilities().iter().any(|cap| {
+                    cap.resolved == fixture.login_db.canonicalize().expect("canonical db")
+                        || cap.resolved == fixture.keychains.canonicalize().expect("canonical root")
+                }),
+                "exercise a real child filesystem grant"
+            );
+            for rule in &state.keychain_deny_rules {
+                assert!(
+                    caps.platform_rules().contains(rule),
+                    "missing restriction: {rule}"
+                );
+            }
+            assert!(!caps.platform_rules().iter().any(|rule| {
+                rule.contains("(allow mach-lookup") && rule.contains("com.apple.securityd")
+            }));
+        }
     }
 }

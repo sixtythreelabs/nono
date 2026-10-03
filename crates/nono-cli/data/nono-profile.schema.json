@@ -789,7 +789,7 @@
         "unix_socket_bind": {
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
-          "description": "Single AF_UNIX socket paths, connect and bind. Implies read+write access on the socket path when it exists, or on its parent directory when it does not yet exist. Dangling symlinks are rejected at grant time; prefer unix_socket_dir_bind for runtime-generated filenames."
+          "description": "Single AF_UNIX socket paths, connect and bind. Implies read+write access on the socket path when it exists, or on its parent directory when it does not yet exist. A covering deny therefore requires bypassing the parent directory. Dangling symlinks are rejected at grant time; prefer unix_socket_dir_bind for runtime-generated filenames."
         },
         "unix_socket_dir": {
           "type": "array",
@@ -819,7 +819,7 @@
         "bypass_protection": {
           "type": "array",
           "items": { "$ref": "#/$defs/ConditionalPath" },
-          "description": "Paths exempted from group-level deny rules. Each path must also appear in an allow/read/write section to actually grant access; bypass_protection only removes the deny. Supports * (single path segment) and ** (any depth) glob patterns, expanded at sandbox start."
+          "description": "Paths exempted from group-level deny rules. A matching filesystem or Unix socket grant must also provide access; bypass_protection only removes the deny. Supports * (single path segment) and ** (any depth) glob patterns, expanded at sandbox start."
         },
         "suppress_save_prompt": {
           "type": "array",
@@ -1558,6 +1558,12 @@
         ]
       }
     },
+    "EnvVarPattern": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\u0000]*[^\\u0000\\s][^\\u0000]*$",
+      "description": "Environment variable name or glob pattern. Must contain at least one non-whitespace character and no NUL byte; an empty or whitespace-only entry is rejected because it would normalize away to no rule at all."
+    },
     "EnvironmentConfig": {
       "type": "object",
       "description": "Controls which environment variables are passed to the sandboxed process. By default all variables are inherited. Precedence (highest to lowest): 1. Hardcoded dangerous vars (always stripped), 2. deny_vars (stripped even if in allow_vars), 3. allow_vars (if non-empty, only matching vars pass).",
@@ -1565,12 +1571,12 @@
       "properties": {
         "allow_vars": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1, "pattern": "^[^\\u0000]+$" },
+          "items": { "$ref": "#/$defs/EnvVarPattern" },
           "description": "Allow-list of environment variable names passed to the sandboxed process. Supports exact names (\"PATH\") and glob patterns where * may appear anywhere in the name (\"AWS_*\", \"*_TOKEN\", \"*SECRET*\"). A bare \"*\" matches everything. When empty or absent, all variables are allowed."
         },
         "deny_vars": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1, "pattern": "^[^\\u0000]+$" },
+          "items": { "$ref": "#/$defs/EnvVarPattern" },
           "description": "Deny-list of environment variable names stripped from the sandboxed process. Supports the same glob syntax as allow_vars (\"GH_TOKEN\", \"GITHUB_*\", \"*_TOKEN\", \"*SECRET*\"). Denied vars are stripped even if they also match allow_vars."
         },
         "case_insensitive_vars": {
@@ -1655,7 +1661,7 @@
         },
         "env_var": {
           "type": "string",
-          "description": "Environment variable mapped into the child. For local-socket this receives the resolved socket path; for proxy this receives the phantom token."
+          "description": "Environment variable mapped into the child. For local-socket this receives the resolved socket path; for ordinary proxy credentials this receives the phantom token. Optional for aws_auth proxy credentials, which sign requests host-side without delivering a credential variable."
         },
         "upstream": {
           "type": "string",
@@ -1696,6 +1702,13 @@
         "format": {
           "type": "string",
           "description": "Optional literal template for the visible phantom the sandbox sees, with '{}' standing in for a freshly minted random body (e.g. 'sk-ant-oat01-{}'). Lets a client that classifies a credential by sniffing a literal token prefix recognise the phantom. Only valid for ambient credentials."
+        },
+        "aws_auth": {
+          "oneOf": [
+            { "$ref": "#/$defs/AwsAuthConfig" },
+            { "type": "null" }
+          ],
+          "description": "Optional AWS SigV4 signing configuration for proxy credentials. Mutually exclusive with source and credential_key. Does not require env_var."
         }
       }
     },
@@ -2330,6 +2343,45 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Non-filesystem sandbox operation names to hide from diagnostic footers, such as forbidden-exec-sugid."
+        },
+        "redaction": {
+          "$ref": "#/$defs/RedactionConfig",
+          "description": "Extra redaction applied to diagnostic and audit output. Add-only: a profile can widen redaction but cannot stop a secure default from being redacted."
+        },
+        "network_denial_audit": {
+          "$ref": "#/$defs/NetworkDenialAuditConfig",
+          "description": "Budget for recording denied network syscalls individually (Linux seccomp mediation). Does not change enforcement."
+        }
+      }
+    },
+    "NetworkDenialAuditConfig": {
+      "type": "object",
+      "description": "Budget for recording denied network syscalls individually in the audit trail and diagnostics. This is output hygiene, not enforcement: a denied syscall is always denied and an allowed one never consumes budget. Denials beyond the budget are counted and reported in one summary audit event. Overridden per run by --network-denial-audit-rate and --network-denial-audit-burst.",
+      "additionalProperties": false,
+      "properties": {
+        "rate_per_sec": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "description": "Sustained number of denials recorded individually per second. Default 20."
+        },
+        "burst": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "description": "Number of denials that may be recorded individually in one burst. Default 50."
+        }
+      }
+    },
+    "RedactionConfig": {
+      "type": "object",
+      "description": "Profile-supplied additions to the output redaction policy. This is output hygiene, not enforcement: it changes what nono writes, never what the sandboxed process can read.",
+      "additionalProperties": false,
+      "properties": {
+        "extra_env_vars": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/EnvVarPattern" },
+          "description": "Environment variable name patterns whose values are replaced with [REDACTED] in diagnostics and audit records. Same glob syntax as environment.deny_vars (\"DEPLOY_TOKEN\", \"ACME_*\", \"*_SECRET\"), matched case-insensitively against the whole name. Only exact environment.deny_vars names are redacted automatically, so a wildcard deny that should also be redacted must be repeated here. Inherited additively through extends."
         }
       }
     },

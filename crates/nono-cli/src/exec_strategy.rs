@@ -21,6 +21,8 @@ use crate::startup_prompt::{notify_startup_termination_for_child, print_terminal
 use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV, DETACHED_SESSION_ID_ENV};
 use nix::libc;
 use nix::sys::signal::{self, Signal};
+#[cfg(target_os = "linux")]
+use nix::sys::wait::{Id, waitid};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, fork};
 use nono::supervisor::{ApprovalDecision, AuditEntry, SupervisorMessage, SupervisorResponse};
@@ -364,6 +366,10 @@ pub struct SupervisorConfig<'a> {
     /// Optional in-memory network/IPC audit events persisted into session metadata.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub network_audit_events: Option<&'a Mutex<Vec<nono::undo::NetworkAuditEvent>>>,
+    /// Running proxy handle, used to snapshot network denial events for the
+    /// diagnostic footer. Read-only here: session finalization performs the
+    /// destructive drain that feeds the persistent audit record.
+    pub proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
     /// Redaction policy for command context in diagnostics.
     pub redaction_policy: &'a nono::ScrubPolicy,
     /// Whether direct LaunchServices opening is enabled for this session.
@@ -381,6 +387,9 @@ pub struct SupervisorConfig<'a> {
     /// Inclusive bind port ranges allowed for seccomp proxy-only fallback.
     #[cfg(target_os = "linux")]
     pub proxy_bind_port_ranges: Vec<(u16, u16)>,
+    /// Budget for recording denied network syscalls individually.
+    #[cfg(target_os = "linux")]
+    pub network_denial_audit: crate::profile::NetworkDenialAuditLimits,
     /// Pathname AF_UNIX socket grants enforced by the seccomp supervisor when
     /// `linux.af_unix_mediation = "pathname"` is enabled. Unused in proxy-only
     /// mode without that opt-in, where AF_UNIX passes through (issue #1901).
@@ -1668,6 +1677,24 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     .iter()
                     .map(|d| nono::try_canonicalize(&d.path))
                     .collect();
+                // Read-only snapshot: the proxy's in-memory event queue is
+                // left intact for the destructive drain in session
+                // finalization, which owns delivery to the audit record.
+                let network_denials: Vec<nono::undo::NetworkAuditEvent> = supervisor
+                    .and_then(|s| s.proxy_handle)
+                    .map(nono_proxy::server::ProxyHandle::snapshot_audit_events)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|event| {
+                        matches!(
+                            event.decision,
+                            nono::undo::NetworkAuditDecision::Deny
+                                | nono::undo::NetworkAuditDecision::ApproveDenied
+                                | nono::undo::NetworkAuditDecision::ApproveTimeout
+                                | nono::undo::NetworkAuditDecision::ApproveError
+                        )
+                    })
+                    .collect();
                 let mut base_formatter = DiagnosticFormatter::new(config.caps)
                     .with_mode(mode)
                     .with_denials(&denials)
@@ -1682,7 +1709,8 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     .with_suppressed_system_service_operations(
                         config.suppressed_system_service_operations,
                     )
-                    .with_canonical_denial_paths(canonical_denial_paths);
+                    .with_canonical_denial_paths(canonical_denial_paths)
+                    .with_network_denials(network_denials);
                 if let Some(program) = config.command.first() {
                     let argv_display: Vec<String> = config
                         .command
@@ -2777,25 +2805,47 @@ type SupervisorLoopResult = (
 /// Reap descendants that reparented onto this supervisor (a child-subreaper),
 /// so short-lived detached processes don't linger as zombies for the session.
 ///
-/// `waitpid(-1, WNOHANG)` returns only terminated children, so a live child is
-/// never consumed. If the primary `child` is reaped here, its status is
-/// returned rather than dropped.
+/// Each terminated child is first observed with `WNOWAIT` and only then reaped
+/// by pid. Children registered in [`crate::owned_children`] belong to another
+/// supervisor thread that waits on them itself, so they are left alone;
+/// consuming their status here would make that thread's wait fail with
+/// `ECHILD`. If the primary `child` is reaped here, its status is returned
+/// rather than dropped.
 #[cfg(target_os = "linux")]
 fn reap_reparented_orphans(child: Pid) -> Option<WaitStatus> {
+    // Held for the whole drain so a concurrent spawn cannot produce a child
+    // that is terminated but not yet registered.
+    let owned = crate::owned_children::lock();
     loop {
-        match waitpid(Some(Pid::from_raw(-1)), Some(WaitPidFlag::WNOHANG)) {
-            Ok(status @ (WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _))) => {
+        let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+        let pid = match waitid(Id::All, flags) {
+            Ok(WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _)) => pid,
+            // Nothing reapable now; no WSTOPPED/WCONTINUED, so ignore stop/continue.
+            Ok(_) => return None,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::ECHILD) => return None,
+            Err(e) => {
+                debug!("waitid(P_ALL) during orphan reap failed: {}", e);
+                return None;
+            }
+        };
+        // `waitid(P_ALL)` keeps reporting the same terminated child until it
+        // is reaped, so stop draining and let its owner collect it. Remaining
+        // orphans are reaped on a later supervisor loop iteration.
+        if pid != child && u32::try_from(pid.as_raw()).is_ok_and(|raw| owned.contains(&raw)) {
+            return None;
+        }
+        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(status @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
                 if pid == child {
                     return Some(status);
                 }
                 debug!("Reaped reparented orphan {}", pid);
             }
-            // Nothing reapable now; no WUNTRACED/WCONTINUED, so ignore stop/continue.
             Ok(_) => return None,
             Err(nix::errno::Errno::EINTR) => continue,
-            Err(nix::errno::Errno::ECHILD) => return None,
             Err(e) => {
-                debug!("waitpid(-1) during orphan reap failed: {}", e);
+                debug!("waitpid({}) during orphan reap failed: {}", pid, e);
                 return None;
             }
         }
@@ -2830,10 +2880,49 @@ fn run_supervisor_loop(
     seccomp_fd: Option<&OwnedFd>,
     proxy_seccomp_fd: Option<&OwnedFd>,
     initial_caps: &[supervisor_linux::InitialCapability],
+    trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
+    pty: Option<&mut crate::pty_proxy::PtyProxy>,
+    url_listener: Option<&SupervisorListener>,
+    killed_by_timeout: &mut bool,
+) -> Result<SupervisorLoopResult> {
+    let mut network_throttle =
+        supervisor_linux::NetworkDenialThrottle::new(config.network_denial_audit);
+    let result = run_supervisor_loop_inner(
+        child,
+        sock,
+        config,
+        startup_timeout,
+        seccomp_fd,
+        proxy_seccomp_fd,
+        initial_caps,
+        trust_interceptor,
+        pty,
+        url_listener,
+        killed_by_timeout,
+        &mut network_throttle,
+    );
+    // The loop has several exits (orphan reaping, startup timeout, errors), so
+    // report denials that were enforced but not individually recorded here,
+    // where every exit passes, rather than at any one of them.
+    supervisor_linux::flush_suppressed_network_denials(config, &mut network_throttle);
+    result
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_supervisor_loop_inner(
+    child: Pid,
+    sock: &mut SupervisorSocket,
+    config: &SupervisorConfig<'_>,
+    startup_timeout: Option<StartupTimeoutConfig<'_>>,
+    seccomp_fd: Option<&OwnedFd>,
+    proxy_seccomp_fd: Option<&OwnedFd>,
+    initial_caps: &[supervisor_linux::InitialCapability],
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
     mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
     url_listener: Option<&SupervisorListener>,
     killed_by_timeout: &mut bool,
+    network_throttle: &mut supervisor_linux::NetworkDenialThrottle,
 ) -> Result<SupervisorLoopResult> {
     struct LoopTimer {
         start: Instant,
@@ -3041,6 +3130,7 @@ fn run_supervisor_loop(
                             trust_interceptor: trust_interceptor.as_mut(),
                             pty: pty.as_deref_mut(),
                         },
+                        &mut *network_throttle,
                         &mut ipc_denials,
                     )
                 {
@@ -3152,7 +3242,7 @@ fn run_supervisor_loop(
                 drain_pending_network_notifications(
                     proxy_notify_raw_fd,
                     config,
-                    &mut rate_limiter,
+                    &mut *network_throttle,
                     &mut denials.fs,
                     &mut ipc_denials,
                 );
@@ -3164,7 +3254,7 @@ fn run_supervisor_loop(
                 drain_pending_network_notifications(
                     proxy_notify_raw_fd,
                     config,
-                    &mut rate_limiter,
+                    &mut *network_throttle,
                     &mut denials.fs,
                     &mut ipc_denials,
                 );
@@ -3192,7 +3282,7 @@ fn run_supervisor_loop(
 fn drain_pending_network_notifications(
     proxy_notify_raw_fd: Option<std::os::fd::RawFd>,
     config: &SupervisorConfig<'_>,
-    rate_limiter: &mut supervisor_linux::RateLimiter,
+    network_throttle: &mut supervisor_linux::NetworkDenialThrottle,
     denials: &mut Vec<DenialRecord>,
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
 ) {
@@ -3213,7 +3303,7 @@ fn drain_pending_network_notifications(
         if let Err(err) = supervisor_linux::handle_network_notification(
             fd,
             config,
-            rate_limiter,
+            network_throttle,
             denials,
             ipc_denials,
         ) {
@@ -3316,6 +3406,9 @@ fn handle_supervisor_message(
             // Set by the trust interceptor branch when an instruction file is verified.
             let mut verified_digest: Option<String> = None;
 
+            // Track whether the approval backend decision was recorded, to avoid double-recording
+            let mut backend_decision_recorded = false;
+
             let decision = if let Some(protected_root) =
                 crate::protected_paths::overlapping_protected_root(
                     &request.path,
@@ -3357,7 +3450,7 @@ fn handle_supervisor_message(
                         // Stash the verified digest for TOCTOU re-check at open time
                         verified_digest = Some(verified.digest);
                         // Instruction file verified — proceed to approval backend
-                        match request_approval_with_relay_paused(
+                        let backend_decision = match request_approval_with_relay_paused(
                             config,
                             &nono::supervisor::ApprovalRequest::from(request.clone()),
                             pty.as_deref_mut(),
@@ -3389,7 +3482,17 @@ fn handle_supervisor_message(
                                     reason: format!("Approval backend error: {e}"),
                                 }
                             }
-                        }
+                        };
+                        // Record the approval backend decision immediately, so it's captured in audit
+                        // even if file operations fail afterward.
+                        record_capability_audit(
+                            config,
+                            nono::supervisor::ApprovalRequest::from(request.clone()),
+                            decision_started,
+                            backend_decision.clone(),
+                        )?;
+                        backend_decision_recorded = true;
+                        backend_decision
                     }
                     Err(reason) => {
                         // Instruction file failed trust verification — auto-deny
@@ -3413,7 +3516,7 @@ fn handle_supervisor_message(
                 }
             } else {
                 // 3. Delegate to approval backend (non-instruction files)
-                match request_approval_with_relay_paused(
+                let backend_decision = match request_approval_with_relay_paused(
                     config,
                     &nono::supervisor::ApprovalRequest::from(request.clone()),
                     pty,
@@ -3445,7 +3548,17 @@ fn handle_supervisor_message(
                             reason: format!("Approval backend error: {e}"),
                         }
                     }
-                }
+                };
+                // Record the approval backend decision immediately, so it's captured in audit
+                // even if file operations fail afterward.
+                record_capability_audit(
+                    config,
+                    nono::supervisor::ApprovalRequest::from(request.clone()),
+                    decision_started,
+                    backend_decision.clone(),
+                )?;
+                backend_decision_recorded = true;
+                backend_decision
             };
 
             // 3. If granted, open the path and send fd before the response
@@ -3467,12 +3580,7 @@ fn handle_supervisor_message(
                                 },
                             };
                             sock.send_response(&response)?;
-                            record_capability_audit(
-                                config,
-                                nono::supervisor::ApprovalRequest::from(request),
-                                decision_started,
-                                response_decision(&response),
-                            )?;
+                            // File operation failure is recorded, but the backend approval was already recorded above
                             return Ok(());
                         }
                     }
@@ -3485,12 +3593,7 @@ fn handle_supervisor_message(
                             },
                         };
                         sock.send_response(&response)?;
-                        record_capability_audit(
-                            config,
-                            nono::supervisor::ApprovalRequest::from(request),
-                            decision_started,
-                            response_decision(&response),
-                        )?;
+                        // File operation failure is recorded, but the backend approval was already recorded above
                         return Ok(());
                     }
                 }
@@ -3502,12 +3605,15 @@ fn handle_supervisor_message(
                 decision,
             };
             sock.send_response(&response)?;
-            record_capability_audit(
-                config,
-                nono::supervisor::ApprovalRequest::from(request),
-                decision_started,
-                response_decision(&response),
-            )?;
+            // Only record audit if we haven't already recorded the approved decision above
+            if !backend_decision_recorded {
+                record_capability_audit(
+                    config,
+                    nono::supervisor::ApprovalRequest::from(request),
+                    decision_started,
+                    response_decision(&response),
+                )?;
+            }
         }
         SupervisorMessage::OpenUrl(url_request) => {
             let request_id = url_request.request_id.clone();
@@ -5162,6 +5268,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5170,6 +5277,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5290,6 +5399,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5298,6 +5408,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5384,6 +5496,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5392,6 +5505,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5431,6 +5546,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5439,6 +5555,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5485,6 +5603,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5493,6 +5612,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5555,6 +5676,7 @@ mod tests {
             open_url_allow_localhost: true,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5563,6 +5685,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5586,6 +5710,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5594,6 +5719,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5636,6 +5763,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5644,6 +5772,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5791,6 +5921,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: true,
             #[cfg(target_os = "linux")]
@@ -5799,6 +5930,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5850,6 +5983,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5858,6 +5992,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5898,6 +6034,7 @@ mod tests {
             open_url_allow_localhost: true,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5906,6 +6043,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5965,6 +6104,7 @@ mod tests {
             open_url_allow_localhost: false,
             audit_recorder: None,
             network_audit_events: None,
+            proxy_handle: None,
             redaction_policy: &nono::ScrubPolicy::secure_default(),
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
@@ -5973,6 +6113,8 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             #[cfg(target_os = "linux")]
             proxy_bind_port_ranges: Vec::new(),
+            #[cfg(target_os = "linux")]
+            network_denial_audit: crate::profile::NetworkDenialAuditLimits::default(),
             #[cfg(target_os = "linux")]
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
@@ -5988,5 +6130,116 @@ mod tests {
 
         let result = validate_url("data:text/html,<script>alert(1)</script>", &config);
         assert!(result.is_err(), "data: URLs must be rejected");
+    }
+}
+
+/// These tests call the wildcard orphan reaper, which would steal children
+/// from tests running concurrently in the same process. Each one re-runs
+/// itself alone in a fresh test process.
+#[cfg(all(test, target_os = "linux"))]
+mod orphan_reap_tests {
+    use super::*;
+
+    const ISOLATED_ENV: &str = "NONO_ORPHAN_REAP_TEST";
+
+    fn isolated(name: &str, test: impl FnOnce()) {
+        if std::env::var(ISOLATED_ENV).ok().as_deref() == Some(name) {
+            test();
+            return;
+        }
+        let executable = std::env::current_exe().expect("test executable");
+        let status = Command::new(executable)
+            .args([
+                "--exact",
+                &format!("exec_strategy::orphan_reap_tests::{name}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ISOLATED_ENV, name)
+            .status()
+            .expect("run isolated test");
+        assert!(status.success(), "isolated {name}: {status}");
+    }
+
+    /// Block until `pid` has terminated, without reaping it.
+    fn wait_until_terminated(pid: u32) {
+        let pid = Pid::from_raw(i32::try_from(pid).expect("pid fits i32"));
+        waitid(Id::Pid(pid), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT)
+            .expect("observe child exit");
+    }
+
+    fn not_a_child() -> Pid {
+        Pid::from_raw(i32::MAX)
+    }
+
+    #[test]
+    fn reaper_leaves_owned_children_to_their_owner() {
+        isolated("reaper_leaves_owned_children_to_their_owner", || {
+            let mut owned = crate::owned_children::spawn(Command::new("sh").args(["-c", "exit 3"]))
+                .expect("spawn owned child");
+            wait_until_terminated(owned.id());
+
+            assert!(reap_reparented_orphans(not_a_child()).is_none());
+
+            let status = owned.wait().expect("owner still reaps its child");
+            assert_eq!(status.code(), Some(3));
+        });
+    }
+
+    #[test]
+    // The reaper under test collects this child; it must not be waited on here.
+    #[allow(clippy::zombie_processes)]
+    fn reaper_collects_unowned_orphans() {
+        isolated("reaper_collects_unowned_orphans", || {
+            let orphan = Command::new("true").spawn().expect("spawn unowned child");
+            let pid = Pid::from_raw(i32::try_from(orphan.id()).expect("pid fits i32"));
+            wait_until_terminated(orphan.id());
+
+            assert!(reap_reparented_orphans(not_a_child()).is_none());
+
+            assert_eq!(
+                waitpid(pid, Some(WaitPidFlag::WNOHANG)),
+                Err(nix::errno::Errno::ECHILD),
+                "unowned zombie must be reaped"
+            );
+        });
+    }
+
+    #[test]
+    // The reaper under test collects this child; it must not be waited on here.
+    #[allow(clippy::zombie_processes)]
+    fn reaper_returns_primary_child_status() {
+        isolated("reaper_returns_primary_child_status", || {
+            let primary = Command::new("sh")
+                .args(["-c", "exit 7"])
+                .spawn()
+                .expect("spawn primary child");
+            let pid = Pid::from_raw(i32::try_from(primary.id()).expect("pid fits i32"));
+            wait_until_terminated(primary.id());
+
+            assert_eq!(
+                reap_reparented_orphans(pid),
+                Some(WaitStatus::Exited(pid, 7))
+            );
+        });
+    }
+
+    #[test]
+    fn reaper_returns_primary_child_status_even_if_it_is_registered() {
+        isolated(
+            "reaper_returns_primary_child_status_even_if_it_is_registered",
+            || {
+                let primary =
+                    crate::owned_children::spawn(Command::new("sh").args(["-c", "exit 5"]))
+                        .expect("spawn primary child");
+                let pid = Pid::from_raw(i32::try_from(primary.id()).expect("pid fits i32"));
+                wait_until_terminated(primary.id());
+
+                assert_eq!(
+                    reap_reparented_orphans(pid),
+                    Some(WaitStatus::Exited(pid, 5))
+                );
+            },
+        );
     }
 }

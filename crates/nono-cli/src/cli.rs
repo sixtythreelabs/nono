@@ -131,11 +131,15 @@ pub enum Commands {
 
 \x1b[1mUSAGE\x1b[0m
   nono run [flags] <program>...
+  nono run --remote --agent <agent> [--workspace <name-or-id>] [prompt]
 
 {all-args}
 {after-help}")]
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
   nono run --allow . claude                    # Read/write current dir, run claude
+  nono run --remote --agent claude             # Choose a workspace and attach
+  nono run --remote --agent claude --workspace my-project --detached
+                                               # Launch remotely without attaching
   nono run --profile nolabs-ai/claude claude        # Use a profile
   nono run --profile nolabs-ai/claude --allow-domain api.openai.com claude
                                                # Restrict outbound access to listed domains
@@ -427,6 +431,9 @@ IN-BAND DETACH:
 
     # Escape hatch: use a complete WebSocket attach URL
     nono connect wss://console.example.com/api/v1/sessions/local:host:abc123/terminal
+
+SESSION PICKER:
+    Use Up/Down or j/k to move, Enter to connect, and q or Esc to cancel.
 "
     )]
     Connect(ConnectArgs),
@@ -1079,8 +1086,8 @@ pub struct SandboxArgs {
     /// If the path exists, implies --allow-file on the socket. If it
     /// does not yet exist (the typical bind(2) case), implies --allow
     /// on the parent directory so the kernel can create the socket
-    /// file. Prefer --allow-unix-socket-dir-bind for runtime-generated
-    /// filenames.
+    /// file. A covering deny therefore requires bypassing the parent.
+    /// Prefer --allow-unix-socket-dir-bind for runtime-generated filenames.
     #[arg(long, value_name = "SOCKET", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_bind: Vec<PathBuf>,
 
@@ -1107,7 +1114,7 @@ pub struct SandboxArgs {
     #[arg(long, value_name = "DIR", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_subtree_bind: Vec<PathBuf>,
 
-    /// Override a deny rule for a path. Pair with --allow/--read/--write grant
+    /// Override a deny rule. Pair with a filesystem or Unix socket grant
     #[arg(
         long = "bypass-protection",
         value_name = "PATH",
@@ -1667,8 +1674,8 @@ pub struct WrapSandboxArgs {
     /// If the path exists, implies --allow-file on the socket. If it
     /// does not yet exist (the typical bind(2) case), implies --allow
     /// on the parent directory so the kernel can create the socket
-    /// file. Prefer --allow-unix-socket-dir-bind for runtime-generated
-    /// filenames.
+    /// file. A covering deny therefore requires bypassing the parent.
+    /// Prefer --allow-unix-socket-dir-bind for runtime-generated filenames.
     #[arg(long, value_name = "SOCKET", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_bind: Vec<PathBuf>,
 
@@ -1695,7 +1702,7 @@ pub struct WrapSandboxArgs {
     #[arg(long, value_name = "DIR", help_heading = "FILESYSTEM")]
     pub allow_unix_socket_subtree_bind: Vec<PathBuf>,
 
-    /// Override a deny rule for a path. Pair with --allow/--read/--write grant
+    /// Override a deny rule. Pair with a filesystem or Unix socket grant
     #[arg(
         long = "bypass-protection",
         value_name = "PATH",
@@ -1901,12 +1908,16 @@ impl From<WrapSandboxArgs> for SandboxArgs {
 #[command(disable_help_flag = true)]
 pub struct RunArgs {
     #[command(flatten)]
+    pub remote_options: RemoteRunArgs,
+
+    #[command(flatten)]
     pub sandbox: SandboxArgs,
 
     /// Start the session without attaching the current terminal.
     /// The supervisor keeps the sandboxed process running in the background;
     /// use `nono attach <session>` later to inspect or interact with it.
-    #[arg(long, help_heading = "OPTIONS")]
+    /// ALIAS(canonical="--detached", introduced="unreleased", remove_by="indefinite", issue="N/A")
+    #[arg(long, alias = "detach", help_heading = "OPTIONS")]
     pub detached: bool,
 
     /// How long (seconds) to wait for a detached session to become attachable.
@@ -1983,6 +1994,31 @@ pub struct RunArgs {
     )]
     pub startup_timeout_secs: Option<u64>,
 
+    /// Sustained number of denied network syscalls recorded individually per
+    /// second (default 20). Denials beyond the budget are still denied and are
+    /// reported in one summary audit event. Overrides
+    /// `diagnostics.network_denial_audit.rate_per_sec`.
+    #[arg(
+        long = "network-denial-audit-rate",
+        value_name = "PER_SEC",
+        value_parser = clap::value_parser!(u32)
+            .range(1..=i64::from(crate::profile::NETWORK_DENIAL_AUDIT_MAX_RATE)),
+        help_heading = "OPTIONS"
+    )]
+    pub network_denial_audit_rate: Option<u32>,
+
+    /// Number of denied network syscalls that may be recorded individually in
+    /// one burst (default 50). Overrides
+    /// `diagnostics.network_denial_audit.burst`.
+    #[arg(
+        long = "network-denial-audit-burst",
+        value_name = "COUNT",
+        value_parser = clap::value_parser!(u32)
+            .range(1..=i64::from(crate::profile::NETWORK_DENIAL_AUDIT_MAX_BURST)),
+        help_heading = "OPTIONS"
+    )]
+    pub network_denial_audit_burst: Option<u32>,
+
     /// Disable the audit trail for this session
     #[arg(
         long,
@@ -2043,6 +2079,35 @@ pub struct RunArgs {
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
     pub help: Option<bool>,
+}
+
+#[derive(clap::Args, Debug, Default)]
+pub struct RemoteRunArgs {
+    /// Launch a persistent agent in a remote workspace and attach this terminal
+    #[arg(long, requires = "agent", help_heading = "REMOTE")]
+    pub remote: bool,
+    /// Server-managed agent to launch (for example claude)
+    #[arg(long, requires = "remote", help_heading = "REMOTE")]
+    pub agent: Option<String>,
+    /// Remote workspace name or ID; prompts when omitted in a terminal
+    #[arg(long, requires = "remote", help_heading = "REMOTE")]
+    pub workspace: Option<String>,
+    /// Platform origin; defaults to the enrolled platform
+    #[arg(long = "platform-url", requires = "remote", help_heading = "REMOTE")]
+    pub platform_url: Option<String>,
+    /// Console origin; defaults to enrolled console discovery
+    #[arg(long, requires = "remote", help_heading = "REMOTE")]
+    pub console: Option<String>,
+    /// Protected Run API personal access token file (or NONO_RUN_TOKEN)
+    #[arg(long = "run-token-file", requires = "remote", help_heading = "REMOTE")]
+    pub run_token_file: Option<PathBuf>,
+    /// Console token file override; normally browser authorization is automatic
+    #[arg(
+        long = "connect-token-file",
+        requires = "remote",
+        help_heading = "REMOTE"
+    )]
+    pub connect_token_file: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -2135,6 +2200,10 @@ pub struct WhyArgs {
     /// Path to check
     #[arg(long, help_heading = "QUERY")]
     pub path: Option<PathBuf>,
+
+    /// Match absolute literal paths against profile rules without resolving them on this host
+    #[arg(long, requires_all = ["path", "profile"], help_heading = "QUERY")]
+    pub lexical_profile_path: bool,
 
     /// Operation to check: read, write, or readwrite
     #[arg(long, value_enum, help_heading = "QUERY")]
@@ -3378,6 +3447,54 @@ mod tests {
                 _ => panic!("Expected Restore subcommand"),
             },
             _ => panic!("Expected Rollback command"),
+        }
+    }
+
+    #[test]
+    fn test_run_network_denial_audit_flags_parse() {
+        let cli = Cli::parse_from([
+            "nono",
+            "run",
+            "--network-denial-audit-rate",
+            "100",
+            "--network-denial-audit-burst",
+            "500",
+            "--",
+            "echo",
+        ]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.network_denial_audit_rate, Some(100));
+                assert_eq!(args.network_denial_audit_burst, Some(500));
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn test_run_network_denial_audit_flags_default_to_unset() {
+        let cli = Cli::parse_from(["nono", "run", "--", "echo"]);
+        match cli.command {
+            Commands::Run(args) => {
+                assert_eq!(args.network_denial_audit_rate, None);
+                assert_eq!(args.network_denial_audit_burst, None);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn test_run_network_denial_audit_flags_reject_out_of_range() {
+        for bad in [
+            ["--network-denial-audit-rate", "0"],
+            ["--network-denial-audit-rate", "1001"],
+            ["--network-denial-audit-burst", "0"],
+            ["--network-denial-audit-burst", "10001"],
+            ["--network-denial-audit-rate", "-1"],
+            ["--network-denial-audit-burst", "abc"],
+        ] {
+            let parsed = Cli::try_parse_from(["nono", "run", bad[0], bad[1], "--", "echo"]);
+            assert!(parsed.is_err(), "{bad:?} must be rejected at parse time");
         }
     }
 

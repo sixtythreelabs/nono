@@ -1,8 +1,5 @@
 use crate::command_policy::{CommandSandboxConfig, ResolvedCommandBinary};
-use crate::tool_sandbox::protocol::{
-    TOOL_SANDBOX_LAUNCH_SPEC_ENV, TOOL_SANDBOX_SHIM_DIR_ENV, TOOL_SANDBOX_SOCKET_ENV,
-    TOOL_SANDBOX_URL_SOCKET_ENV, ToolSandboxShimRequest,
-};
+use crate::tool_sandbox::protocol::ToolSandboxShimRequest;
 use nono::{NonoError, Result};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -176,46 +173,37 @@ pub(crate) fn apply_export_env(
 /// Replace proxy settings with supervisor-owned values immediately before a
 /// mediated command is launched. The child must not retain the session proxy
 /// credential: it has broader authority than a command-scoped proxy policy.
+///
+/// **Replace, never append.** `env` is a raw `KEY=VALUE` vector handed straight
+/// to `execve`; it does not collapse duplicate keys, and libc `getenv` (plus
+/// CPython's `os.environ`, i.e. botocore) resolves a duplicate to the *first*
+/// entry. An appended override is therefore dead whenever the same name was
+/// already forwarded from the session env, so every name in `vars` is stripped
+/// before it is set. That is wider than `PROXY_CONTROL_ENV`: `vars` comes from
+/// `ProxyHandle::env_vars()`, which also carries the TLS-intercept CA vars
+/// (`SSL_CERT_FILE`, `AWS_CA_BUNDLE`, ...). Deriving the strip set from `vars`
+/// keeps this self-maintaining as `intercept_ca_env_vars` (or a profile's
+/// `tls_intercept.ca_env_vars`) grows. `PROXY_CONTROL_ENV` is still stripped
+/// unconditionally so a session proxy credential cannot survive in a name the
+/// scoped proxy happens not to set.
 pub(crate) fn override_proxy_env(env: &mut Vec<Vec<u8>>, vars: &[(String, String)]) {
     env.retain(|entry| {
-        !PROXY_CONTROL_ENV.iter().any(|name| {
-            entry
-                .strip_prefix(name.as_bytes())
-                .is_some_and(|suffix| suffix.starts_with(b"="))
-        })
+        let Some((name, _)) = split_env_entry(entry) else {
+            return true;
+        };
+        !PROXY_CONTROL_ENV
+            .iter()
+            .any(|control| control.as_bytes() == name)
+            && !vars.iter().any(|(set, _)| set.as_bytes() == name)
     });
     for (name, value) in vars {
         env.push(format!("{name}={value}").into_bytes());
     }
 }
 
-pub(crate) fn inject_chaining_control_env(
-    env: &mut Vec<Vec<u8>>,
-    socket_path: &Path,
-    shim_dir: &Path,
-) {
-    let socket_prefix = format!("{TOOL_SANDBOX_SOCKET_ENV}=");
-    let shim_dir_prefix = format!("{TOOL_SANDBOX_SHIM_DIR_ENV}=");
-    let launch_spec_prefix = format!("{TOOL_SANDBOX_LAUNCH_SPEC_ENV}=");
-    env.retain(|entry| {
-        !entry.starts_with(socket_prefix.as_bytes())
-            && !entry.starts_with(shim_dir_prefix.as_bytes())
-            && !entry.starts_with(launch_spec_prefix.as_bytes())
-    });
-    env.push(format!("{TOOL_SANDBOX_SOCKET_ENV}={}", socket_path.display()).into_bytes());
-    env.push(format!("{TOOL_SANDBOX_SHIM_DIR_ENV}={}", shim_dir.display()).into_bytes());
-}
-
-/// Inject the URL-open socket env var and `BROWSER` for a brokered child whose
-/// command declares `open_urls` or `allow_launch_services`.
-///
-/// Both vars are stripped first (a child cannot smuggle its own) then set to
-/// the runtime's URL socket and the open shim path. Needed for
-/// `allow_launch_services` too: the shim only recognizes itself as the
-/// URL-open relay when this env var is present, and a bare `open` in the
-/// child's $PATH always resolves to the shim, never straight to
-/// `/usr/bin/open`, once any command in the profile needs the shim. No-op
-/// when URL opening is not enabled for this command.
+/// Point `BROWSER` at the session's open shim for a child whose policy allows
+/// URL opening. The shim discovers the URL socket from its executable path;
+/// the broker resolves the caller and enforces its URL policy on each request.
 pub(crate) fn inject_url_open_env(
     env: &mut Vec<Vec<u8>>,
     policy: &CommandSandboxConfig,
@@ -225,15 +213,9 @@ pub(crate) fn inject_url_open_env(
     if policy.open_urls.is_none() && !policy.allow_launch_services {
         return;
     }
-    let (Some(url_socket_path), Some(shim_path)) = (url_socket_path, url_open_shim_path) else {
+    let (Some(_), Some(shim_path)) = (url_socket_path, url_open_shim_path) else {
         return;
     };
-
-    let socket_prefix = format!("{TOOL_SANDBOX_URL_SOCKET_ENV}=").into_bytes();
-    env.retain(|entry| !entry.starts_with(&socket_prefix));
-    let mut socket_entry = socket_prefix;
-    socket_entry.extend_from_slice(url_socket_path.as_os_str().as_bytes());
-    env.push(socket_entry);
 
     // Point BROWSER at the open shim so libraries that honour it route through
     // the runtime instead of attempting a (denied) direct browser launch.
@@ -836,6 +818,55 @@ mod tests {
     }
 
     #[test]
+    fn scoped_proxy_env_replaces_forwarded_intercept_ca_vars() {
+        // Regression: the scoped CA vars used to be APPENDED after the
+        // session-forwarded ones. `env` goes straight to `execve`, which keeps
+        // duplicates, and libc `getenv` / CPython `os.environ` resolve to the
+        // FIRST entry — so `aws` (botocore) validated TLS against the session
+        // bundle and failed with "SSL validation failed ... [Errno 1]".
+        // A `contains`-style assertion passes even with the bug: the count and
+        // the value together are what matter.
+        const SESSION_CA: &str = "/Users/dev/.local/prisma_certificates.pem";
+        const SCOPED_CA: &str = "/private/tmp/nono-scoped-intercept-1-2-scope-0/intercept-ca.pem";
+        let ca_vars = nono_proxy::config::default_intercept_ca_env_vars();
+        assert!(
+            ca_vars.iter().any(|name| name == "AWS_CA_BUNDLE"),
+            "AWS_CA_BUNDLE must be an intercept-CA var: botocore prefers it over SSL_CERT_FILE"
+        );
+
+        let mut env: Vec<Vec<u8>> = ca_vars
+            .iter()
+            .map(|name| format!("{name}={SESSION_CA}").into_bytes())
+            .collect();
+        env.push(b"PATH=/usr/bin".to_vec());
+        let scoped: Vec<(String, String)> = ca_vars
+            .iter()
+            .map(|name| (name.clone(), SCOPED_CA.to_string()))
+            .collect();
+
+        override_proxy_env(&mut env, &scoped);
+
+        let rendered = rendered(&env);
+        assert!(rendered.contains(&"PATH=/usr/bin".to_string()));
+        assert!(
+            !rendered.iter().any(|entry| entry.contains(SESSION_CA)),
+            "session CA must not survive: {rendered:?}"
+        );
+        for name in &ca_vars {
+            let prefix = format!("{name}=");
+            let matches: Vec<&String> = rendered
+                .iter()
+                .filter(|entry| entry.starts_with(&prefix))
+                .collect();
+            assert_eq!(
+                matches,
+                vec![&format!("{name}={SCOPED_CA}")],
+                "{name} must appear exactly once, set to the scoped CA"
+            );
+        }
+    }
+
+    #[test]
     fn inject_url_open_env_covers_allow_launch_services_without_open_urls() {
         let policy = CommandSandboxConfig {
             allow_launch_services: true,
@@ -849,12 +880,7 @@ mod tests {
             Some(Path::new("/tmp/shims/open")),
         );
 
-        let socket_prefix = format!("{TOOL_SANDBOX_URL_SOCKET_ENV}=").into_bytes();
-        assert!(
-            env.iter().any(|e| e.starts_with(&socket_prefix)),
-            "allow_launch_services must get the URL socket env var, since the shim only \
-             recognizes itself as the URL-open relay when it's present"
-        );
+        assert!(env.iter().all(|entry| !entry.starts_with(b"NONO_")));
         assert!(
             env.iter().any(|e| e.starts_with(b"BROWSER=")),
             "allow_launch_services must get BROWSER pointed at the shim too"
