@@ -2939,7 +2939,7 @@ fn emit_deprecation_summary(count: usize) {
 /// This produces a fully-resolved, portable manifest with absolute paths.
 /// Environment variables (`~`, `$HOME`, `$TMPDIR`, etc.) are expanded.
 #[allow(deprecated)] // reads commands.{allow,deny} (deprecated v0.33.0)
-fn resolve_to_manifest(
+pub(crate) fn resolve_to_manifest(
     prof: &Profile,
     workdir: &std::path::Path,
 ) -> Result<nono::manifest::CapabilityManifest> {
